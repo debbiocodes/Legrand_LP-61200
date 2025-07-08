@@ -1,6 +1,6 @@
 --[[
 Legrand PDU Control Script for Q-SYS Designer
-Version: 3.11
+Version: 3.12
 Description: Comprehensive control and monitoring for Legrand PDU devices via TCP/IP
 Author: Daniel De Biasi
 
@@ -30,6 +30,7 @@ Required Q-Sys Controls:
 - Status (String) - Connection status display
 - Power state (Boolean Array) - Individual outlet toggles
 - Power State Groups (Boolean Array) - Group outlet toggles
+- Power_Operation (Boolean Array) - Operation mode selection [1]=ON/OFF, [2]=Cycle
 - Processing (Boolean) - Processing state indicator
 - Waiting Response (Boolean) - Response waiting indicator
 - Confirm (Button Array) - Confirmation buttons [1]=Yes, [2]=No
@@ -60,13 +61,15 @@ Default Configuration:
 Usage:
 1. Configure IP address, port, username, and password
 2. Click Connect to establish connection
-3. Use outlet toggles for individual control
-4. Use group toggles for group control
-5. Use cycle buttons for power cycling operations
-6. Send group name to "Group Trigger String" to toggle group power state (case-insensitive)
-7. Monitor real-time readings and status indicators
+3. Select Power Operation mode: [1]=ON/OFF or [2]=Cycle
+4. Use outlet toggles for individual control (behavior depends on selected mode)
+5. Use group toggles for group control (behavior depends on selected mode)
+6. Use cycle buttons for power cycling operations (independent of mode)
+7. Send group name to "Group Trigger String" to toggle group power state (case-insensitive)
+8. Monitor real-time readings and status indicators
 
 VERSION LOGS:
+v3.12 - Added Power_Operation control with mutual exclusivity - toggle between ON/OFF and Cycle modes for outlet and group operations
 v3.11 - Added string-based group trigger functionality - send group name to toggle group power state
 v3.10 - Fixed Raritan PDU compatibility, retry loop prevention, and confirmation button state management
 v3.9 - Fixed toggle state reversion - now only reverts the specific item being operated on instead of all items
@@ -272,6 +275,9 @@ local Processing = Controls["Processing"]
 local WaitingResponse = Controls["Waiting Response"]
 local ConfirmBtn = Controls.Confirm
 
+-- Power Operation Mode Control
+local Power_Operation = Controls["Power_Operation"]
+
 -- Broadcast Communication Controls
 local BroadcastGroupCycle = Controls["Broadcast Group Cycle"]
 local BroadcastGroupName = Controls["Broadcast Group Name"]
@@ -346,6 +352,56 @@ local function SetWaitingState(state)
     isWaitingForResponse = state
 end
 
+-- Handle Power Operation mode selection (mutual exclusivity)
+local function HandlePowerOperationMode(selectedIndex)
+    if not Power_Operation then return end
+    
+    -- Ensure only one toggle is selected at a time
+    for i = 1, #Power_Operation do
+        if Power_Operation[i] then
+            if i == selectedIndex then
+                Power_Operation[i].Boolean = true
+                DebugLog("DEBUG", "Power Operation mode set to: %d", i)
+            else
+                Power_Operation[i].Boolean = false
+            end
+        end
+    end
+end
+
+-- Initialize Power Operation mode without resetting existing selection
+local function InitializePowerOperationMode()
+    if not Power_Operation then return end
+    
+    -- Check if any toggle is already selected
+    local hasSelection = false
+    for i = 1, #Power_Operation do
+        if Power_Operation[i] and Power_Operation[i].Boolean then
+            hasSelection = true
+            break
+        end
+    end
+    
+    -- Only set default if no toggle is currently selected
+    if not hasSelection and Power_Operation[2] then
+        HandlePowerOperationMode(2)
+        DebugLog("DEBUG", "No Power Operation mode selected, setting default to Cycle mode")
+    end
+end
+
+-- Get current power operation mode (1 = ON/OFF, 2 = Cycle)
+local function GetPowerOperationMode()
+    if not Power_Operation then return 2 end -- Default to Cycle mode
+    
+    for i = 1, #Power_Operation do
+        if Power_Operation[i] and Power_Operation[i].Boolean then
+            return i
+        end
+    end
+    
+    return 2 -- Default to Cycle mode if none selected
+end
+
 -- Initialize all states
 local function InitializeStates()
     if isGroupOperationInProgress then
@@ -376,6 +432,9 @@ local function InitializeStates()
     
     if BroadcastGroupName then BroadcastGroupName.String = "" end
     if BroadcastGroupCycle then BroadcastGroupCycle.Boolean = false end
+    
+    -- Initialize Power Operation mode (preserves existing selection)
+    InitializePowerOperationMode()
     
     -- Enable all controls
     UpdatePowerControls()
@@ -1205,27 +1264,61 @@ if Power_State then
                 return
             end
             if not isProcessingCommand then
-                DebugLog("INFO", "Power Toggle triggered for outlet %d", i)
+                local operationMode = GetPowerOperationMode()
                 
-                StoreCurrentState()
-                currentOperation = {
-                    type = "outlet",
-                    index = i,
-                    state = not ctl.Boolean  -- Store the previous state (opposite of current)
-                }
-                
-                isUserInitiatedCommand = true
-                SetWaitingState(true)
-                timeoutTimer:Start(CONFIG.TIMEOUT)
+                if operationMode == 1 then
+                    -- ON/OFF mode
+                    DebugLog("INFO", "Power Toggle triggered for outlet %d (ON/OFF mode)", i)
+                    
+                    StoreCurrentState()
+                    currentOperation = {
+                        type = "outlet",
+                        index = i,
+                        state = not ctl.Boolean  -- Store the previous state (opposite of current)
+                    }
+                    
+                    isUserInitiatedCommand = true
+                    SetWaitingState(true)
+                    timeoutTimer:Start(CONFIG.TIMEOUT)
 
-                local powerToggleState = ctl.Boolean
+                    local powerToggleState = ctl.Boolean
 
-                if powerToggleState then
-                    sendTCP("power outlets ".. i .. " on")
-                    DebugLog("INFO", "Sent command: power outlets %d on", i)
-                else
-                    sendTCP("power outlets ".. i .. " off")
-                    DebugLog("INFO", "Sent command: power outlets %d off", i)
+                    if powerToggleState then
+                        sendTCP("power outlets ".. i .. " on")
+                        DebugLog("INFO", "Sent command: power outlets %d on", i)
+                    else
+                        sendTCP("power outlets ".. i .. " off")
+                        DebugLog("INFO", "Sent command: power outlets %d off", i)
+                    end
+                elseif operationMode == 2 then
+                    -- Cycle mode
+                    DebugLog("INFO", "Power Cycle triggered for outlet %d (Cycle mode)", i)
+                    
+                    StoreCurrentState()
+                    currentOperation = {
+                        type = "cycle_outlet",
+                        index = i,
+                        state = ctl.Boolean  -- Store current state for cycle operations
+                    }
+                    
+                    isUserInitiatedCommand = true
+                    SetWaitingState(true)
+                    timeoutTimer:Start(CONFIG.TIMEOUT)
+
+                    sendTCP("power outlets ".. i .. " cycle")
+                    DebugLog("INFO", "Sent command: power outlets %d cycle", i)
+
+                    CreateSafeTimer(3, function()
+                        if tcp.IsConnected then
+                            sendTCP("show outlets")
+                            CreateSafeTimer(1, function()
+                                if tcp.IsConnected then
+                                    sendTCP("show outletgroups")
+                                    DebugLog("DEBUG", "Sent status update commands after cycle")
+                                end
+                            end)
+                        end
+                    end)
                 end
             else
                 ctl.Boolean = not ctl.Boolean
@@ -1243,30 +1336,63 @@ if Power_State_Group then
                 return
             end
             
+            local operationMode = GetPowerOperationMode()
             local groupName = Power_State_Group[i].Legend or ("Group " .. i)
-            local action = ctl.Boolean and "ON" or "OFF"
             
-            DebugLog("INFO", "Power Group Toggle triggered for group %d (%s) - turning %s", i, groupName, action)
-            
-            StoreCurrentState()
-            currentOperation = {
-                type = "group",
-                index = i,
-                state = not ctl.Boolean  -- Store the previous state (opposite of current)
-            }
-            
-            isUserInitiatedCommand = true
-            SetWaitingState(true)
-            timeoutTimer:Start(CONFIG.TIMEOUT)
-            
-            isGroupOperationInProgress = true
+            if operationMode == 1 then
+                -- ON/OFF mode
+                local action = ctl.Boolean and "ON" or "OFF"
+                DebugLog("INFO", "Power Group Toggle triggered for group %d (%s) - turning %s (ON/OFF mode)", i, groupName, action)
+                
+                StoreCurrentState()
+                currentOperation = {
+                    type = "group",
+                    index = i,
+                    state = not ctl.Boolean  -- Store the previous state (opposite of current)
+                }
+                
+                isUserInitiatedCommand = true
+                SetWaitingState(true)
+                timeoutTimer:Start(CONFIG.TIMEOUT)
+                
+                isGroupOperationInProgress = true
 
-            if ctl.Boolean == true then
-                sendTCP("power outletgroup ".. i .. " on")
-                DebugLog("INFO", "Sent command: power outletgroup %d on", i)
-            else
-                sendTCP("power outletgroup ".. i .. " off")
-                DebugLog("INFO", "Sent command: power outletgroup %d off", i)
+                if ctl.Boolean == true then
+                    sendTCP("power outletgroup ".. i .. " on")
+                    DebugLog("INFO", "Sent command: power outletgroup %d on", i)
+                else
+                    sendTCP("power outletgroup ".. i .. " off")
+                    DebugLog("INFO", "Sent command: power outletgroup %d off", i)
+                end
+            elseif operationMode == 2 then
+                -- Cycle mode
+                DebugLog("INFO", "Power Group Cycle triggered for group %d (%s) (Cycle mode)", i, groupName)
+                
+                StoreCurrentState()
+                currentOperation = {
+                    type = "cycle_group",
+                    index = i,
+                    state = ctl.Boolean  -- Store current state for cycle operations
+                }
+                
+                pendingCycleGroup = i
+                
+                isBroadcastReceiver = false
+                isProcessingBroadcast = true
+                isWaitingForCycle = true
+                
+                isUserInitiatedCommand = true
+                SetWaitingState(true)
+                timeoutTimer:Start(CONFIG.TIMEOUT * 2)
+
+                if BroadcastGroupCycle and BroadcastGroupName then
+                    BroadcastGroupName.String = groupName
+                    DebugLog("INFO", "Broadcasting for group: %s", groupName)
+                    BroadcastGroupCycle:Trigger()
+                end
+                
+                DebugLog("INFO", "Sending cycle command for initiating PDU")
+                sendTCP("power outletgroup ".. i .. " cycle")
             end
         end
     end
@@ -1520,6 +1646,22 @@ if GroupTriggerString then
                 end)
             else
                 DebugLog("WARNING", "Failed to trigger group: %s", groupName)
+            end
+        end
+    end
+end
+
+-- Power Operation mode handlers
+if Power_Operation then
+    for i = 1, #Power_Operation do
+        Power_Operation[i].EventHandler = function(ctl)
+            if ctl.Boolean then
+                HandlePowerOperationMode(i)
+                DebugLog("INFO", "Power Operation mode changed to: %d", i)
+            else
+                -- Prevent deselection - if user tries to deselect, reselect it
+                ctl.Boolean = true
+                DebugLog("DEBUG", "Prevented deselection of Power Operation mode %d", i)
             end
         end
     end
