@@ -1,0 +1,53 @@
+PluginInfo = {
+  Name = "Legrand~PDU Control Plugin",
+  Version = "3.12",
+  Id = "legrand.pdu.control.3.12",
+  Description = "Comprehensive control and monitoring for Legrand PDU devices via TCP/IP",
+  Author = "Daniel De Biasi",
+  ShowDebug = true
+}
+
+function GetProperties()
+  return {}
+end
+
+function GetControls(props)
+  return {
+    { Name = "Status", ControlType = "Text", UserPin = true },
+    { Name = "IP Address", ControlType = "Text", UserPin = true },
+    { Name = "Port", ControlType = "Knob", ControlUnit = "Integer", Min = 1, Max = 65535, UserPin = true },
+    { Name = "Connect", ControlType = "Button", ButtonType = "Toggle", UserPin = true },
+    { Name = "Username", ControlType = "Text", UserPin = true },
+    { Name = "Password", ControlType = "Text", UserPin = true },
+    { Name = "RMS Current", ControlType = "Text", UserPin = true },
+    { Name = "Active Power", ControlType = "Text", UserPin = true },
+    { Name = "Temperature", ControlType = "Text", UserPin = true },
+    { Name = "Humidity", ControlType = "Text", UserPin = true },
+    { Name = "Group Trigger String", ControlType = "Text", UserPin = true },
+    { Name = "Power State Groups", ControlType = "Button", ButtonType = "Toggle", Count = 10, UserPin = true },
+    { Name = "Power state", ControlType = "Button", ButtonType = "Toggle", Count = 24, UserPin = true },
+    { Name = "Power_Operation", ControlType = "Button", ButtonType = "Toggle", Count = 2, UserPin = true },
+    { Name = "Power Cycle Outlets", ControlType = "Button", ButtonType = "Trigger", Count = 24, UserPin = true },
+    { Name = "Power Cycle Groups", ControlType = "Button", ButtonType = "Trigger", Count = 10, UserPin = true },
+    { Name = "Processing", ControlType = "Indicator", IndicatorType = "Led", UserPin = true },
+    { Name = "Waiting Response", ControlType = "Indicator", IndicatorType = "Led", UserPin = true },
+    { Name = "Confirm", ControlType = "Button", ButtonType = "Momentary", Count = 2, UserPin = true },
+    { Name = "Broadcast Group Cycle", ControlType = "Button", ButtonType = "Trigger", UserPin = true },
+    { Name = "Broadcast Group Name", ControlType = "Text", UserPin = true }
+  }
+end
+
+function GetControlLayout(props)
+  local layout = {
+    { Style = "GroupBox", Legend = "CONNECTION", Controls = { "Status", "IP Address", "Port", "Connect", "Username", "Password" } },
+    { Style = "GroupBox", Legend = "READINGS", Controls = { "RMS Current", "Active Power", "Temperature", "Humidity" } },
+    { Style = "GroupBox", Legend = "CONTROL", Controls = {
+      "Group Trigger String", "Power State Groups", "Power state", "Power_Operation", "Power Cycle Outlets", "Power Cycle Groups", "Processing", "Waiting Response", "Confirm", "Broadcast Group Cycle", "Broadcast Group Name"
+    } }
+  }
+  return layout, {}
+end
+
+-- ===================== MAIN LOGIC =====================
+-- The following is the main logic from Legrand V3.7.lua, adapted for plugin context
+-- ... existing code ... 
