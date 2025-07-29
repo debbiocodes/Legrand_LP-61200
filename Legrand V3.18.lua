@@ -1,6 +1,6 @@
 --[[
 Legrand PDU Control Script for Q-SYS Designer
-Version: 3.12
+Version: 3.18
 Description: Comprehensive control and monitoring for Legrand PDU devices via TCP/IP
 Author: Daniel De Biasi
 
@@ -20,6 +20,8 @@ Features:
 - Error handling and timeout management
 - Command queuing and response processing
 - Support for outlet ranges and efficient command batching
+- NEW: Commands only sent when user confirms with Yes button
+- NEW: Only one toggle can be selected at a time
 
 Required Q-Sys Controls:
 - IP Address (String) - PDU IP address
@@ -67,8 +69,17 @@ Usage:
 6. Use cycle buttons for power cycling operations (independent of mode)
 7. Send group name to "Group Trigger String" to toggle group power state (case-insensitive)
 8. Monitor real-time readings and status indicators
+9. NEW: Toggle any outlet/group to prepare command, then press Yes to execute or No to cancel
 
 VERSION LOGS:
+v3.18 - FIXED: Waiting Response LED stuck ON - properly clear WaitingResponse control after PDU response
+v3.17 - FIXED: Confirm buttons disabled issue - prevent UpdatePowerControls from disabling controls during user confirmation
+v3.16 - FIXED: Double confirmation issue - properly maintain user confirmation state until PDU response is received
+v3.15 - FIXED: Double confirmation issue - PDU confirmation prompts are now auto-confirmed when user has already confirmed through the UI
+v3.14 - NEW: Implemented confirmation-based command system - commands only sent when user presses Yes button
+v3.14 - NEW: Only one toggle can be selected at a time to prevent conflicts
+v3.14 - NEW: Commands are prepared when toggles are pressed but not sent until confirmed
+v3.13 - Modified string-based group trigger to default to power cycle instead of on/off toggle - now uses broadcast communication for synchronized cycling
 v3.12 - Added Power_Operation control with mutual exclusivity - toggle between ON/OFF and Cycle modes for outlet and group operations
 v3.11 - Added string-based group trigger functionality - send group name to toggle group power state
 v3.10 - Fixed Raritan PDU compatibility, retry loop prevention, and confirmation button state management
@@ -106,7 +117,7 @@ local DEBUG = true -- Set to false to disable debug prints (verbose logging has 
 
 -- Configuration constants
 local CONFIG = {
-    TIMEOUT = 5,
+    TIMEOUT = 10,
     POLL_INTERVAL = 30,
     BUFFER_SIZE = 8192,
     BROADCAST_COOLDOWN = 1,
@@ -164,7 +175,7 @@ local function IsValidIP(ip)
     return true
 end
 
--- Validate required controls exist
+-- Validate required controls exist with safe access
 local function ValidateControls()
     local required = {"IP Address", "Port", "Connect", "Status", "Username", "Password"}
     for _, name in ipairs(required) do
@@ -176,9 +187,55 @@ local function ValidateControls()
     return true
 end
 
--- Create safe timer with cleanup
+-- Safe control access function
+local function SafeGetControl(controlName)
+    if not controlName or type(controlName) ~= "string" then
+        return nil
+    end
+    return Controls[controlName]
+end
+
+-- Safe control value access
+local function SafeGetControlValue(control, isString)
+    if not control then return isString and "" or 0 end
+    
+    local success, result = pcall(function()
+        if isString then
+            return control.String or ""
+        else
+            return control.Value or 0
+        end
+    end)
+    
+    if not success then
+        DebugLog("ERROR", "Failed to get control value: %s", tostring(result))
+        return isString and "" or 0
+    end
+    
+    return result
+end
+
+-- Create safe timer with cleanup and maximum limit
 local activeTimers = {}
+local MAX_ACTIVE_TIMERS = 50 -- Prevent timer explosion
+
 local function CreateSafeTimer(delay, callback)
+    -- Clean up any stopped timers first
+    for i = #activeTimers, 1, -1 do
+        if not activeTimers[i]:IsRunning() then
+            table.remove(activeTimers, i)
+        end
+    end
+    
+    -- Prevent timer explosion
+    if #activeTimers >= MAX_ACTIVE_TIMERS then
+        DebugLog("WARNING", "Too many active timers (%d), cleaning up oldest", #activeTimers)
+        if #activeTimers > 0 then
+            activeTimers[1]:Stop()
+            table.remove(activeTimers, 1)
+        end
+    end
+    
     local timer = Timer.New()
     timer.EventHandler = function()
         callback()
@@ -242,6 +299,17 @@ local previousGroupState = nil
 local previousOutletState = nil
 local isRevertingStates = false
 
+-- NEW: Pending command system for confirmation-based execution
+local pendingCommand = {
+    type = nil,        -- "outlet", "group", "cycle_outlet", "cycle_group"
+    index = nil,       -- outlet or group index
+    command = nil,     -- the actual command string to send
+    targetState = nil, -- the target state (true/false for on/off)
+    description = nil  -- human-readable description of the operation
+}
+local isWaitingForUserConfirmation = false
+local lastToggledControl = nil
+
 -- Data Buffers
 local responseBuffer = ""
 local commandQueue = {}
@@ -297,6 +365,153 @@ local function SetConfirmButtonState(enabled)
     end
 end
 
+-- Function to set waiting state
+local function SetWaitingState(state)
+    if WaitingResponse then
+        WaitingResponse.Boolean = state
+    end
+    isWaitingForResponse = state
+end
+
+-- NEW: Function to prepare a command for confirmation
+local function PrepareCommand(commandType, index, command, targetState, description)
+    if not tcp.IsConnected then
+        DebugLog("ERROR", "TCP connection not available. Cannot prepare command.")
+        return false
+    end
+    
+    -- If already waiting for confirmation, update the pending command instead of showing warning
+    if isWaitingForUserConfirmation then
+        DebugLog("INFO", "Updating pending command from previous selection")
+        
+        -- Revert the previous toggle that was pressed
+        if lastToggledControl then
+            lastToggledControl.Boolean = not lastToggledControl.Boolean
+        end
+    end
+    
+    -- Store the new pending command
+    pendingCommand = {
+        type = commandType,
+        index = index,
+        command = command,
+        targetState = targetState,
+        description = description
+    }
+    
+    isWaitingForUserConfirmation = true
+    SetWaitingState(true)
+    SetConfirmButtonState(true)
+    
+    -- Restart the timeout timer for the new command
+    if timeoutTimer:IsRunning() then timeoutTimer:Stop() end
+    timeoutTimer:Start(CONFIG.TIMEOUT)
+    
+    -- Auto-clear pending command after extended timeout (30 seconds) to prevent system lockup
+    CreateSafeTimer(30, function()
+        if isWaitingForUserConfirmation then
+            DebugLog("WARNING", "Extended timeout reached - auto-cancelling pending command")
+            CancelPendingCommand()
+        end
+    end)
+    
+    DebugLog("INFO", "Command prepared for confirmation: %s", description)
+    return true
+end
+
+-- NEW: Function to execute the pending command
+local function ExecutePendingCommand()
+    if not pendingCommand.command then
+        DebugLog("ERROR", "No pending command to execute")
+        return false
+    end
+    
+    DebugLog("INFO", "Executing pending command: %s", pendingCommand.description)
+    
+    -- Store current state for potential cancellation
+    StoreCurrentState()
+    currentOperation = {
+        type = pendingCommand.type,
+        index = pendingCommand.index,
+        state = pendingCommand.targetState
+    }
+    
+    isUserInitiatedCommand = true
+    SetWaitingState(true)
+    timeoutTimer:Start(CONFIG.TIMEOUT)
+    
+    -- Handle group operations
+    if pendingCommand.type == "group" or pendingCommand.type == "cycle_group" then
+        isGroupOperationInProgress = true
+        
+        -- Set up broadcast communication for cycle operations
+        if pendingCommand.type == "cycle_group" then
+            pendingCycleGroup = pendingCommand.index
+            isBroadcastReceiver = false
+            isProcessingBroadcast = true
+            isWaitingForCycle = true
+            
+            -- Trigger broadcast for synchronized cycle across PDUs
+            if BroadcastGroupCycle and BroadcastGroupName then
+                local groupName = Power_State_Group and Power_State_Group[pendingCommand.index] and Power_State_Group[pendingCommand.index].Legend or ("Group " .. pendingCommand.index)
+                BroadcastGroupName.String = groupName
+                DebugLog("INFO", "Broadcasting for group: %s", groupName)
+                BroadcastGroupCycle:Trigger()
+            end
+        end
+    end
+    
+    -- Send the actual command
+    sendTCP(pendingCommand.command)
+    DebugLog("INFO", "Sent command: %s", pendingCommand.command)
+    
+    -- Clear pending command but keep isWaitingForUserConfirmation true until PDU responds
+    pendingCommand = {
+        type = nil,
+        index = nil,
+        command = nil,
+        targetState = nil,
+        description = nil
+    }
+    -- Don't set isWaitingForUserConfirmation = false here - let the PDU response handler do it
+    
+    return true
+end
+
+-- NEW: Function to cancel pending command
+local function CancelPendingCommand()
+    if not isWaitingForUserConfirmation then
+        DebugLog("WARNING", "No pending command to cancel")
+        return false
+    end
+    
+    DebugLog("INFO", "Cancelling pending command: %s", pendingCommand.description or "Unknown")
+    
+    -- Revert the toggle that was pressed
+    if lastToggledControl then
+        lastToggledControl.Boolean = not lastToggledControl.Boolean
+        lastToggledControl = nil
+    end
+    
+    -- Clear pending command
+    pendingCommand = {
+        type = nil,
+        index = nil,
+        command = nil,
+        targetState = nil,
+        description = nil
+    }
+    isWaitingForUserConfirmation = false
+    SetWaitingState(false)
+    SetConfirmButtonState(false)
+    
+    if timeoutTimer:IsRunning() then timeoutTimer:Stop() end
+    
+    return true
+end
+
+
+
 -- Function to Update Status Display
 local function StatusUpdate(msg, state)
     if Status then
@@ -307,7 +522,8 @@ end
 
 -- Update power controls based on processing state
 local function UpdatePowerControls()
-    local shouldDisable = (Processing and Processing.Boolean) or (WaitingResponse and WaitingResponse.Boolean)
+    -- Don't disable controls when waiting for user confirmation - only disable when processing actual commands
+    local shouldDisable = (Processing and Processing.Boolean) or (WaitingResponse and WaitingResponse.Boolean and not isWaitingForUserConfirmation)
     
     -- Update individual outlets
     if Power_State then
@@ -343,13 +559,6 @@ local function SetProcessingState(state)
     
     isProcessingCommand = state
     UpdatePowerControls()
-end
-
-local function SetWaitingState(state)
-    if WaitingResponse then
-        WaitingResponse.Boolean = state
-    end
-    isWaitingForResponse = state
 end
 
 -- Handle Power Operation mode selection (mutual exclusivity)
@@ -421,6 +630,17 @@ local function InitializeStates()
     isWaitingForCycle = false
     isBroadcastCancelled = false
     
+    -- NEW: Reset confirmation system states
+    isWaitingForUserConfirmation = false
+    lastToggledControl = nil
+    pendingCommand = {
+        type = nil,
+        index = nil,
+        command = nil,
+        targetState = nil,
+        description = nil
+    }
+    
     -- Reset broadcast related variables
     lastBroadcastTime = 0
     lastBroadcastName = ""
@@ -429,6 +649,7 @@ local function InitializeStates()
     -- Reset UI controls
     SetProcessingState(false)
     SetWaitingState(false)
+    SetConfirmButtonState(false)
     
     if BroadcastGroupName then BroadcastGroupName.String = "" end
     if BroadcastGroupCycle then BroadcastGroupCycle.Boolean = false end
@@ -447,11 +668,46 @@ local function InitializeStates()
     if timeoutTimer:IsRunning() then timeoutTimer:Stop() end
 end
 
--- Enhanced command sending with retry logic
+-- Enhanced command sending with retry logic and safety checks
 local commandRetryCount = 0
 local lastCommandSent = ""
 local lastCommandTime = 0
 local maxRetryTime = 30  -- Maximum time to keep retrying (30 seconds)
+
+-- Function to send login credentials (bypasses command sanitization)
+local function sendLoginCredential(credential)
+    if not credential or type(credential) ~= "string" then
+        DebugLog("ERROR", "Invalid credential parameter")
+        return
+    end
+    
+    if not tcp then
+        DebugLog("ERROR", "TCP socket not initialized")
+        return
+    end
+    
+    if tcp.IsConnected then
+        DebugLog("DEBUG", "sendLoginCredential: Sending credential: %s", string.rep("*", #credential))
+        
+        -- Use pcall to catch write errors
+        local success, err = pcall(function()
+            tcp:Write(credential.."\r\n")
+        end)
+        
+        if not success then
+            DebugLog("ERROR", "Failed to send credential: %s", tostring(err))
+            performanceStats.errors = performanceStats.errors + 1
+            errorStats.commandErrors = errorStats.commandErrors + 1
+            return
+        end
+        
+        performanceStats.commandsSent = performanceStats.commandsSent + 1
+    else
+        DebugLog("ERROR", "Socket not connected - cannot send credential")
+        performanceStats.errors = performanceStats.errors + 1
+        errorStats.commandErrors = errorStats.commandErrors + 1
+    end
+end
 
 function sendTCP(command)
     if not command or type(command) ~= "string" then
@@ -459,9 +715,36 @@ function sendTCP(command)
         return
     end
     
+    -- Sanitize PDU commands to prevent injection
+    -- Skip sanitization for login credentials (usernames/passwords)
+    if not command:match("^[a-zA-Z0-9!@#$%%^&*()_+=<>?\"'`~\\|]+$") then
+        -- This is likely a PDU command, so sanitize it
+        if string.find(command, "[^%w%s%-%.%:]") then
+            DebugLog("ERROR", "PDU command contains invalid characters: %s", command)
+            return
+        end
+    end
+    
+    if not tcp then
+        DebugLog("ERROR", "TCP socket not initialized")
+        return
+    end
+    
     if tcp.IsConnected then
         DebugLog("DEBUG", "sendTCP: Sending command: %s", command)
-        tcp:Write(command.."\r\n")
+        
+        -- Use pcall to catch write errors
+        local success, err = pcall(function()
+            tcp:Write(command.."\r\n")
+        end)
+        
+        if not success then
+            DebugLog("ERROR", "Failed to send command: %s", tostring(err))
+            performanceStats.errors = performanceStats.errors + 1
+            errorStats.commandErrors = errorStats.commandErrors + 1
+            return
+        end
+        
         performanceStats.commandsSent = performanceStats.commandsSent + 1
         lastCommandSent = command
         commandRetryCount = 0
@@ -578,10 +861,22 @@ local function QueueCommands()
     ProcessNextCommand()
 end
 
--- Poll data periodically
+-- Poll data periodically with safety checks
+local pollFailCount = 0
+local MAX_POLL_FAILURES = 5
+
 local function PollData()
+    -- Prevent infinite polling loops
+    if pollFailCount >= MAX_POLL_FAILURES then
+        DebugLog("ERROR", "Too many poll failures (%d), stopping polling", pollFailCount)
+        isPollingActive = false
+        pollFailCount = 0
+        return
+    end
+    
     if isWaitingForResponse or isProcessingCommand or pendingConfirmation or isGroupOperationInProgress or isRevertingStates then
         DebugLog("DEBUG", "Skipping poll - system busy")
+        pollFailCount = pollFailCount + 1
         CreateSafeTimer(CONFIG.POLL_INTERVAL, function()
             isPollingActive = false
             PollData()
@@ -591,6 +886,7 @@ local function PollData()
 
     if not isPollingActive and not isProcessingCommand then
         isPollingActive = true
+        pollFailCount = 0 -- Reset failure count on successful poll
         DebugLog("INFO", "Polling PDU for data...")
         QueueCommands()
     end
@@ -715,6 +1011,74 @@ end
 
 -- Command confirmation handler
 local function confirmCommand()
+    -- NEW: Handle user confirmation for pending commands
+    if isWaitingForUserConfirmation then
+        if timeoutTimer:IsRunning() then timeoutTimer:Stop() end
+        
+        DebugLog("INFO", "User confirmed pending command")
+        
+        if ExecutePendingCommand() then
+            SetProcessingState(true)
+            DebugLog("DEBUG", "Command executed - Processing LED turned ON")
+            
+            -- Wait for operation to complete before sending status updates
+            CreateSafeTimer(1, function()
+                if not tcp.IsConnected then 
+                    InitializeStates() 
+                    return 
+                end
+                
+                DebugLog("DEBUG", "Command executed, waiting for operation to complete...")
+                
+                CreateSafeTimer(2, function()
+                    if not tcp.IsConnected then 
+                        InitializeStates() 
+                        return 
+                    end
+                    
+                    DebugLog("DEBUG", "Sending status refresh commands...")
+                    
+                    sendTCP("show outlets")
+                    
+                    CreateSafeTimer(1, function()
+                        if tcp.IsConnected then
+                            sendTCP("show outletgroups")
+                        end
+                    end)
+                    
+                    CreateSafeTimer(3, function()
+                        if not tcp.IsConnected then 
+                            InitializeStates() 
+                            return 
+                        end
+                        
+                        DebugLog("DEBUG", "Status refresh commands sent, waiting for responses...")
+                        
+                        CreateSafeTimer(5, function()
+                            SafeRestartPolling()
+                        end)
+                        
+                    end)
+                    
+                end)
+                
+            end)
+            
+            -- Safety timeout
+            CreateSafeTimer(30, function()
+                if Processing and Processing.Boolean then
+                    DebugLog("WARNING", "Processing LED timeout - forcing OFF after 30 seconds")
+                    SetProcessingState(false)
+                    isWaitingForUserConfirmation = false
+                    SetConfirmButtonState(false)
+                    SetWaitingState(false)
+                end
+            end)
+        end
+        return
+    end
+    
+    -- OLD: Handle PDU confirmation prompts (legacy support)
     if not isWaitingForResponse or not pendingConfirmation then
         return
     end
@@ -722,14 +1086,14 @@ local function confirmCommand()
     if timeoutTimer:IsRunning() then timeoutTimer:Stop() end
 
     sendTCP("y")
-    DebugLog("INFO", "Command confirmed - sending 'y'")
+    DebugLog("INFO", "PDU command confirmed - sending 'y'")
 
     pendingConfirmation = false
     SetConfirmButtonState(false)
     SetWaitingState(false)
     SetProcessingState(true)
     
-    DebugLog("DEBUG", "Command confirmed - Processing LED turned ON")
+    DebugLog("DEBUG", "PDU command confirmed - Processing LED turned ON")
 
     -- Wait for operation to complete before sending status updates
     CreateSafeTimer(1, function()
@@ -738,7 +1102,7 @@ local function confirmCommand()
             return 
         end
         
-        DebugLog("DEBUG", "Command confirmed, waiting for operation to complete...")
+        DebugLog("DEBUG", "PDU command confirmed, waiting for operation to complete...")
         
         CreateSafeTimer(2, function()
             if not tcp.IsConnected then 
@@ -788,6 +1152,14 @@ end
 
 -- Command cancellation handler
 local function cancelCommand()
+    -- NEW: Handle user cancellation for pending commands
+    if isWaitingForUserConfirmation then
+        DebugLog("INFO", "User cancelled pending command")
+        CancelPendingCommand()
+        return
+    end
+    
+    -- OLD: Handle PDU confirmation cancellation (legacy support)
     if not isWaitingForResponse or not pendingConfirmation then
         return
     end
@@ -795,7 +1167,7 @@ local function cancelCommand()
     if timeoutTimer:IsRunning() then timeoutTimer:Stop() end
 
     sendTCP("n")
-    DebugLog("INFO", "Command cancelled - sending 'n'")
+    DebugLog("INFO", "PDU command cancelled - sending 'n'")
 
     pendingConfirmation = false
     SetConfirmButtonState(false)
@@ -819,7 +1191,9 @@ end
 
 tcp.EventHandler = function(sock, evt, err)
     if evt == TcpSocket.Events.Connected then
-        DebugLog("INFO", "Socket connected successfully to %s:%d", IP.String, Port.Value)
+        local ipAddress = SafeGetControlValue(IP, true)
+        local portValue = SafeGetControlValue(Port, false)
+        DebugLog("INFO", "Socket connected successfully to %s:%d", ipAddress, portValue)
         StatusUpdate("Connected", 0)
         isLoggedIn = false  
         isWaitingForResponse = false
@@ -831,31 +1205,50 @@ tcp.EventHandler = function(sock, evt, err)
 
     elseif evt == TcpSocket.Events.Data then
         local data = sock:Read(sock.BufferLength)
+        -- Prevent buffer overflow with hard limit
         if #responseBuffer > CONFIG.BUFFER_SIZE then
+            DebugLog("WARNING", "Response buffer overflow, clearing buffer")
             responseBuffer = ""
         end
+        
+        -- Additional safety check for extremely large data
+        if #data > CONFIG.BUFFER_SIZE then
+            DebugLog("ERROR", "Received oversized data chunk (%d bytes), discarding", #data)
+            return
+        end
+        
         responseBuffer = responseBuffer .. data
 
         -- Check for confirmation prompts
         if string.find(responseBuffer, "Do you wish to") then
-            DebugLog("DEBUG", "Detected confirmation prompt - waiting for user input")
+            DebugLog("DEBUG", "Detected PDU confirmation prompt")
             
-            pendingConfirmation = true
-            SetWaitingState(true)
-            SetConfirmButtonState(true)
-            timeoutTimer:Start(CONFIG.TIMEOUT)
-            
-            responseBuffer = ""
-            return
+            -- If we're already in the NEW confirmation system, auto-confirm the PDU prompt
+            if isWaitingForUserConfirmation then
+                DebugLog("DEBUG", "Already in user confirmation mode - auto-confirming PDU prompt")
+                sendTCP("y")
+                responseBuffer = ""
+                return
+            else
+                -- Legacy PDU confirmation handling
+                DebugLog("DEBUG", "Legacy PDU confirmation prompt - waiting for user input")
+                pendingConfirmation = true
+                SetWaitingState(true)
+                SetConfirmButtonState(true)
+                timeoutTimer:Start(CONFIG.TIMEOUT)
+                responseBuffer = ""
+                return
+            end
         end
 
         -- Handle login prompts
         if string.find(responseBuffer, "Username:") then
             DebugLog("INFO", "Detected Username prompt, sending username...")
             CreateSafeTimer(0.5, function()
-                if tcp.IsConnected then
-                    sendTCP(Username.String)
-                    DebugLog("INFO", "Sent username: %s", Username.String)
+                if tcp.IsConnected and Username then
+                    local username = SafeGetControlValue(Username, true)
+                    sendLoginCredential(username)
+                    DebugLog("INFO", "Sent username: %s", username)
                 end
             end)
             responseBuffer = ""
@@ -863,9 +1256,10 @@ tcp.EventHandler = function(sock, evt, err)
         elseif string.find(responseBuffer, "Password:") then
             DebugLog("INFO", "Detected Password prompt, sending password...")
             CreateSafeTimer(1.0, function()
-                if tcp.IsConnected then
-                    sendTCP(Password.String)
-                    DebugLog("INFO", "Sent password: %s", string.rep("*", #Password.String))
+                if tcp.IsConnected and Password then
+                    local password = SafeGetControlValue(Password, true)
+                    sendLoginCredential(password)
+                    DebugLog("INFO", "Sent password: %s", string.rep("*", #password))
                 end
             end)
             responseBuffer = ""
@@ -892,29 +1286,36 @@ tcp.EventHandler = function(sock, evt, err)
         elseif isLoggedIn and string.find(responseBuffer, CONFIG.PROMPT) then
             -- DebugLog("DEBUG", "Full response received: %s", DebugFormat(responseBuffer))
 
-            -- Extract monitoring values
-            local current = string.match(responseBuffer, "RMS Current:%s*([%d%.]+)%s*A")
-            if current and RMS_Current then
-                RMS_Current.String = current .. " A"
-                DebugLog("DEBUG", "Updated RMS Current: %s", RMS_Current.String)
-            end
+                        -- Use pcall to catch parsing errors
+            local success, err = pcall(function()
+                -- Extract monitoring values
+                local current = string.match(responseBuffer, "RMS Current:%s*([%d%.]+)%s*A")
+                if current and RMS_Current then
+                    RMS_Current.String = current .. " A"
+                    DebugLog("DEBUG", "Updated RMS Current: %s", RMS_Current.String)
+                end
 
-            local power = string.match(responseBuffer, "Reading:%s*([%d%.]+)%s*W")
-            if power and Active_Power then
-                Active_Power.String = power .. " W"
-                DebugLog("DEBUG", "Updated Active Power: %s", Active_Power.String)
-            end
+                local power = string.match(responseBuffer, "Reading:%s*([%d%.]+)%s*W")
+                if power and Active_Power then
+                    Active_Power.String = power .. " W"
+                    DebugLog("DEBUG", "Updated Active Power: %s", Active_Power.String)
+                end
 
-            local temp = string.match(responseBuffer, "Reading:%s*([%d%.]+)%s*deg C")
-            if temp and Temperature then
-                Temperature.String = temp .. " °C"
-                DebugLog("DEBUG", "Updated Temperature: %s", Temperature.String)
-            end
+                local temp = string.match(responseBuffer, "Reading:%s*([%d%.]+)%s*deg C")
+                if temp and Temperature then
+                    Temperature.String = temp .. " °C"
+                    DebugLog("DEBUG", "Updated Temperature: %s", Temperature.String)
+                end
 
-            local humidity = string.match(responseBuffer, "Reading:%s*([%d%.]+)%s*%%")
-            if humidity and Humidity then
-                Humidity.String = humidity .. " %"
-                DebugLog("DEBUG", "Updated Humidity: %s", Humidity.String)
+                local humidity = string.match(responseBuffer, "Reading:%s*([%d%.]+)%s*%%")
+                if humidity and Humidity then
+                    Humidity.String = humidity .. " %"
+                    DebugLog("DEBUG", "Updated Humidity: %s", Humidity.String)
+                end
+            end)
+            
+            if not success then
+                DebugLog("ERROR", "Failed to parse monitoring values: %s", tostring(err))
             end
 
             -- Parse outlet states
@@ -935,6 +1336,7 @@ tcp.EventHandler = function(sock, evt, err)
                             outletCount = outletCount + 1
                             outletStates[index] = {name = name, state = state, isOn = isOn}
                             
+                            -- Set outlet name, preserving original PDU names
                             if name and name ~= "" then
                                 Power_State[index].Legend = name
                                 if Power_Cycle and Power_Cycle[index] then
@@ -1066,8 +1468,19 @@ tcp.EventHandler = function(sock, evt, err)
                 SetProcessingState(false)
             end
             
+            -- Clear user confirmation state after PDU response is received
+            if isWaitingForUserConfirmation then
+                DebugLog("DEBUG", "Clearing user confirmation state after PDU response")
+                isWaitingForUserConfirmation = false
+                SetConfirmButtonState(false)
+                lastToggledControl = nil
+            end
+            
             isWaitingForResponse = false  
             isProcessingCommand = false
+            
+            -- Update the WaitingResponse control to reflect the cleared state
+            SetWaitingState(false)
             
             -- Clear group operation flags
             if isGroupOperationInProgress then
@@ -1095,7 +1508,7 @@ tcp.EventHandler = function(sock, evt, err)
         responseBuffer = ""
         
         -- Attempt reconnection if this wasn't a manual disconnect
-        if Connect.Boolean then
+        if Connect and Connect.Boolean then
             AttemptReconnection()
         end
 
@@ -1108,7 +1521,7 @@ tcp.EventHandler = function(sock, evt, err)
         responseBuffer = ""
         
         -- Attempt reconnection for recoverable errors
-        if Connect.Boolean then
+        if Connect and Connect.Boolean then
             AttemptReconnection()
         end
 
@@ -1121,7 +1534,7 @@ tcp.EventHandler = function(sock, evt, err)
         responseBuffer = ""
         
         -- Attempt reconnection for timeout errors
-        if Connect.Boolean then
+        if Connect and Connect.Boolean then
             AttemptReconnection()
         end
     end
@@ -1131,18 +1544,40 @@ end
 -- CONNECTION MANAGEMENT
 -- =============================================================================
 
--- Establish TCP connection
+-- Establish TCP connection with safety checks
 local function TcpOpen()
+    if not Connect then
+        DebugLog("ERROR", "Connect control not available")
+        return
+    end
+    
     if Connect.Boolean then
         if tcp.IsConnected then return end
         
-        if not IsValidIP(IP.String) then
-            DebugLog("ERROR", "Invalid IP address: %s", IP.String)
+        local ipAddress = SafeGetControlValue(IP, true)
+        local portValue = SafeGetControlValue(Port, false)
+        
+        if not IsValidIP(ipAddress) then
+            DebugLog("ERROR", "Invalid IP address: %s", ipAddress)
             return
         end
         
-        DebugLog("INFO", "Connecting to PDU: %s:%d", IP.String, Port.Value)
-        tcp:Connect(IP.String, Port.Value)
+        if portValue <= 0 or portValue > 65535 then
+            DebugLog("ERROR", "Invalid port number: %d", portValue)
+            return
+        end
+        
+        DebugLog("INFO", "Connecting to PDU: %s:%d", ipAddress, portValue)
+        
+        -- Use pcall to catch connection errors
+        local success, err = pcall(function()
+            tcp:Connect(ipAddress, portValue)
+        end)
+        
+        if not success then
+            DebugLog("ERROR", "Failed to initiate connection: %s", tostring(err))
+            StatusUpdate("Connection Failed", 2)
+        end
     else
         if tcp.IsConnected then
             tcp:Disconnect()
@@ -1155,16 +1590,18 @@ end
 
 -- Auto-connect when script starts
 local function AutoConnect()
-    if not tcp.IsConnected and IP.String and IP.String ~= "" then
+    if not tcp.IsConnected and IP and IP.String and IP.String ~= "" then
         DebugLog("INFO", "Auto-connecting to PDU on startup...")
-        Connect.Boolean = true
+        if Connect then
+            Connect.Boolean = true
+        end
         TcpOpen()
     end
 end
 
 -- Enhanced reconnection with exponential backoff
 local function AttemptReconnection()
-    if not tcp.IsConnected and IP.String and IP.String ~= "" then
+    if not tcp.IsConnected and IP and IP.String and IP.String ~= "" then
         local currentTime = os.time()
         
         -- Check if we've exceeded max attempts
@@ -1202,8 +1639,16 @@ end
 -- =============================================================================
 
 timeoutTimer.EventHandler = function()
+    -- NEW: Handle user confirmation timeout
+    if isWaitingForUserConfirmation then
+        DebugLog("INFO", "User confirmation timeout - cancelling pending command")
+        CancelPendingCommand()
+        return
+    end
+    
+    -- OLD: Handle PDU confirmation timeout (legacy support)
     if pendingConfirmation then
-        DebugLog("INFO", "Confirmation timeout - sending 'n'")
+        DebugLog("INFO", "PDU confirmation timeout - sending 'n'")
         sendTCP("n")
         pendingConfirmation = false
         SetConfirmButtonState(false)
@@ -1263,65 +1708,44 @@ if Power_State then
                 ctl.Boolean = not ctl.Boolean
                 return
             end
-            if not isProcessingCommand then
-                local operationMode = GetPowerOperationMode()
+            
+            local operationMode = GetPowerOperationMode()
+            local outletName = ctl.Legend or tostring(i)
+            
+            if operationMode == 1 then
+                -- ON/OFF mode
+                local action = ctl.Boolean and "ON" or "OFF"
+                local description = string.format("Turn %s %s", outletName, action)
+                local command = string.format("power outlets %d %s", i, string.lower(action))
                 
-                if operationMode == 1 then
-                    -- ON/OFF mode
-                    DebugLog("INFO", "Power Toggle triggered for outlet %d (ON/OFF mode)", i)
-                    
-                    StoreCurrentState()
-                    currentOperation = {
-                        type = "outlet",
-                        index = i,
-                        state = not ctl.Boolean  -- Store the previous state (opposite of current)
-                    }
-                    
-                    isUserInitiatedCommand = true
-                    SetWaitingState(true)
-                    timeoutTimer:Start(CONFIG.TIMEOUT)
-
-                    local powerToggleState = ctl.Boolean
-
-                    if powerToggleState then
-                        sendTCP("power outlets ".. i .. " on")
-                        DebugLog("INFO", "Sent command: power outlets %d on", i)
-                    else
-                        sendTCP("power outlets ".. i .. " off")
-                        DebugLog("INFO", "Sent command: power outlets %d off", i)
-                    end
-                elseif operationMode == 2 then
-                    -- Cycle mode
-                    DebugLog("INFO", "Power Cycle triggered for outlet %d (Cycle mode)", i)
-                    
-                    StoreCurrentState()
-                    currentOperation = {
-                        type = "cycle_outlet",
-                        index = i,
-                        state = ctl.Boolean  -- Store current state for cycle operations
-                    }
-                    
-                    isUserInitiatedCommand = true
-                    SetWaitingState(true)
-                    timeoutTimer:Start(CONFIG.TIMEOUT)
-
-                    sendTCP("power outlets ".. i .. " cycle")
-                    DebugLog("INFO", "Sent command: power outlets %d cycle", i)
-
-                    CreateSafeTimer(3, function()
-                        if tcp.IsConnected then
-                            sendTCP("show outlets")
-                            CreateSafeTimer(1, function()
-                                if tcp.IsConnected then
-                                    sendTCP("show outletgroups")
-                                    DebugLog("DEBUG", "Sent status update commands after cycle")
-                                end
-                            end)
-                        end
-                    end)
+                DebugLog("INFO", "Power Toggle prepared for outlet %d (%s) - %s (ON/OFF mode)", i, outletName, action)
+                
+                if PrepareCommand("outlet", i, command, ctl.Boolean, description) then
+                    DebugLog("INFO", "Command prepared: %s", command)
+                    -- Store reference to the toggled control for potential reversion
+                    lastToggledControl = ctl
+                else
+                    -- Revert the toggle if command preparation failed
+                    ctl.Boolean = not ctl.Boolean
+                    lastToggledControl = nil
                 end
-            else
-                ctl.Boolean = not ctl.Boolean
+                
+            elseif operationMode == 2 then
+                -- Cycle mode
+                local description = string.format("Power cycle %s", outletName)
+                local command = string.format("power outlets %d cycle", i)
+                
+                DebugLog("INFO", "Power Cycle prepared for outlet %d (%s) (Cycle mode)", i, outletName)
+                
+                if PrepareCommand("cycle_outlet", i, command, ctl.Boolean, description) then
+                    DebugLog("INFO", "Command prepared: %s", command)
+                    -- Store reference to the toggled control for potential reversion
+                    lastToggledControl = ctl
+                else
+                    -- Revert the toggle if command preparation failed
+                    ctl.Boolean = not ctl.Boolean
+                    lastToggledControl = nil
+                end
             end
         end
     end
@@ -1342,57 +1766,37 @@ if Power_State_Group then
             if operationMode == 1 then
                 -- ON/OFF mode
                 local action = ctl.Boolean and "ON" or "OFF"
-                DebugLog("INFO", "Power Group Toggle triggered for group %d (%s) - turning %s (ON/OFF mode)", i, groupName, action)
+                local description = string.format("Turn %s %s", groupName, action)
+                local command = string.format("power outletgroup %d %s", i, string.lower(action))
                 
-                StoreCurrentState()
-                currentOperation = {
-                    type = "group",
-                    index = i,
-                    state = not ctl.Boolean  -- Store the previous state (opposite of current)
-                }
+                DebugLog("INFO", "Power Group Toggle prepared for group %d (%s) - %s (ON/OFF mode)", i, groupName, action)
                 
-                isUserInitiatedCommand = true
-                SetWaitingState(true)
-                timeoutTimer:Start(CONFIG.TIMEOUT)
-                
-                isGroupOperationInProgress = true
-
-                if ctl.Boolean == true then
-                    sendTCP("power outletgroup ".. i .. " on")
-                    DebugLog("INFO", "Sent command: power outletgroup %d on", i)
+                if PrepareCommand("group", i, command, ctl.Boolean, description) then
+                    DebugLog("INFO", "Command prepared: %s", command)
+                    -- Store reference to the toggled control for potential reversion
+                    lastToggledControl = ctl
                 else
-                    sendTCP("power outletgroup ".. i .. " off")
-                    DebugLog("INFO", "Sent command: power outletgroup %d off", i)
+                    -- Revert the toggle if command preparation failed
+                    ctl.Boolean = not ctl.Boolean
+                    lastToggledControl = nil
                 end
+                
             elseif operationMode == 2 then
                 -- Cycle mode
-                DebugLog("INFO", "Power Group Cycle triggered for group %d (%s) (Cycle mode)", i, groupName)
+                local description = string.format("Power cycle %s", groupName)
+                local command = string.format("power outletgroup %d cycle", i)
                 
-                StoreCurrentState()
-                currentOperation = {
-                    type = "cycle_group",
-                    index = i,
-                    state = ctl.Boolean  -- Store current state for cycle operations
-                }
+                DebugLog("INFO", "Power Group Cycle prepared for group %d (%s) (Cycle mode)", i, groupName)
                 
-                pendingCycleGroup = i
-                
-                isBroadcastReceiver = false
-                isProcessingBroadcast = true
-                isWaitingForCycle = true
-                
-                isUserInitiatedCommand = true
-                SetWaitingState(true)
-                timeoutTimer:Start(CONFIG.TIMEOUT * 2)
-
-                if BroadcastGroupCycle and BroadcastGroupName then
-                    BroadcastGroupName.String = groupName
-                    DebugLog("INFO", "Broadcasting for group: %s", groupName)
-                    BroadcastGroupCycle:Trigger()
+                if PrepareCommand("cycle_group", i, command, ctl.Boolean, description) then
+                    DebugLog("INFO", "Command prepared: %s", command)
+                    -- Store reference to the toggled control for potential reversion
+                    lastToggledControl = ctl
+                else
+                    -- Revert the toggle if command preparation failed
+                    ctl.Boolean = not ctl.Boolean
+                    lastToggledControl = nil
                 end
-                
-                DebugLog("INFO", "Sending cycle command for initiating PDU")
-                sendTCP("power outletgroup ".. i .. " cycle")
             end
         end
     end
@@ -1481,33 +1885,41 @@ local function TriggerGroupByName(groupName)
     
     local groupControl = Power_State_Group[groupIndex]
     local currentState = groupControl.Boolean
-    local newState = not currentState
-    local action = newState and "ON" or "OFF"
     
-    DebugLog("INFO", "String trigger: Group '%s' (index %d) - turning %s", groupName, groupIndex, action)
+    DebugLog("INFO", "String trigger: Group '%s' (index %d) - power cycling", groupName, groupIndex)
     
     -- Store current state for potential cancellation
     StoreCurrentState()
     currentOperation = {
-        type = "group",
+        type = "cycle_group",
         index = groupIndex,
-        state = currentState  -- Store the current state before toggle
+        state = currentState  -- Store current state for cycle operations
     }
     
-    -- Directly trigger the group operation instead of relying on control state change
+    -- Set up broadcast communication for cycle operation
+    pendingCycleGroup = groupIndex
+    
+    isBroadcastReceiver = false
+    isProcessingBroadcast = true
+    isWaitingForCycle = true
+    
+    -- Directly trigger the group cycle operation
     isUserInitiatedCommand = true
     SetWaitingState(true)
-    timeoutTimer:Start(CONFIG.TIMEOUT)
+    timeoutTimer:Start(CONFIG.TIMEOUT * 2)
     
     isGroupOperationInProgress = true
 
-    if newState == true then
-        sendTCP("power outletgroup ".. groupIndex .. " on")
-        DebugLog("INFO", "String trigger sent command: power outletgroup %d on", groupIndex)
-    else
-        sendTCP("power outletgroup ".. groupIndex .. " off")
-        DebugLog("INFO", "String trigger sent command: power outletgroup %d off", groupIndex)
+    -- Trigger broadcast for synchronized cycle across PDUs
+    if BroadcastGroupCycle and BroadcastGroupName then
+        BroadcastGroupName.String = groupName
+        DebugLog("INFO", "Broadcasting cycle for group: %s", groupName)
+        BroadcastGroupCycle:Trigger()
     end
+    
+    -- Send cycle command for the initiating PDU
+    sendTCP("power outletgroup ".. groupIndex .. " cycle")
+    DebugLog("INFO", "String trigger sent command: power outletgroup %d cycle", groupIndex)
     
     return true
 end
@@ -1721,6 +2133,40 @@ end
 -- INITIALIZATION
 -- =============================================================================
 
+-- Global error handler to catch unhandled errors
+local function GlobalErrorHandler(err)
+    DebugLog("CRITICAL", "Unhandled error caught: %s", tostring(err))
+    DebugLog("CRITICAL", "Stack trace: %s", debug.traceback())
+    
+    -- Emergency cleanup
+    CleanupTimers()
+    if tcp and tcp.IsConnected then
+        tcp:Disconnect()
+    end
+    
+    -- Reset all states
+    InitializeStates()
+    
+    -- Attempt recovery after delay
+    CreateSafeTimer(10, function()
+        DebugLog("INFO", "Attempting recovery after error...")
+        if Connect and Connect.Boolean then
+            TcpOpen()
+        end
+    end)
+end
+
+-- Set up error handler
+local oldErrorHandler = debug.getmetatable("").__index
+debug.setmetatable("", {
+    __index = function(t, k)
+        if k == "error" then
+            return GlobalErrorHandler
+        end
+        return oldErrorHandler[k]
+    end
+})
+
 -- Validate controls on startup
 if not ValidateControls() then
     DebugLog("ERROR", "Required controls not found. Script may not function properly.")
@@ -1748,7 +2194,7 @@ CreateSafeTimer(300, function() -- Every 5 minutes
     end
     
     -- Check connection health
-    if not tcp.IsConnected and Connect.Boolean then
+    if not tcp.IsConnected and Connect and Connect.Boolean then
         DebugLog("WARNING", "Connection lost but Connect button is ON - attempting reconnection")
         AttemptReconnection()
     end
@@ -1760,5 +2206,5 @@ CreateSafeTimer(0.1, AutoConnect)
 -- =============================================================================
 -- SCRIPT INITIALIZATION COMPLETE
 -- =============================================================================
-DebugLog("INFO", "Legrand PDU Control Script v3.11 initialized successfully")
+DebugLog("INFO", "Legrand PDU Control Script v3.18 initialized successfully")
 DebugLog("INFO", "Waiting for connection configuration...")
