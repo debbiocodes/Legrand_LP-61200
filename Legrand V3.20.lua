@@ -1,6 +1,6 @@
 --[[
 Legrand PDU Control Script for Q-SYS Designer
-Version: 3.18
+Version: 3.20
 Description: Comprehensive control and monitoring for Legrand PDU devices via TCP/IP
 Author: Daniel De Biasi
 
@@ -72,6 +72,8 @@ Usage:
 9. NEW: Toggle any outlet/group to prepare command, then press Yes to execute or No to cancel
 
 VERSION LOGS:
+v3.20 - FIXED: Group trigger string confirmation system - now uses new confirmation system instead of legacy PDU confirmation
+v3.19 - FIXED: Group trigger string busy state issue - clear stuck broadcast flags when group not found and add safety mechanisms
 v3.18 - FIXED: Waiting Response LED stuck ON - properly clear WaitingResponse control after PDU response
 v3.17 - FIXED: Confirm buttons disabled issue - prevent UpdatePowerControls from disabling controls during user confirmation
 v3.16 - FIXED: Double confirmation issue - properly maintain user confirmation state until PDU response is received
@@ -121,7 +123,7 @@ local CONFIG = {
     POLL_INTERVAL = 30,
     BUFFER_SIZE = 8192,
     BROADCAST_COOLDOWN = 1,
-    PROMPT = "%[My PDU%] #",
+    PROMPT = "%[.-%] #",  -- Accepts any text between [ ] followed by #
     MAX_OUTLETS = 24,
     MAX_GROUPS = 10,
     -- Enhanced error recovery settings
@@ -309,6 +311,7 @@ local pendingCommand = {
 }
 local isWaitingForUserConfirmation = false
 local lastToggledControl = nil
+local pendingStringTrigger = nil  -- Track string trigger that needs to be cleared after execution
 
 -- Data Buffers
 local responseBuffer = ""
@@ -374,7 +377,7 @@ local function SetWaitingState(state)
 end
 
 -- NEW: Function to prepare a command for confirmation
-local function PrepareCommand(commandType, index, command, targetState, description)
+local function PrepareCommand(commandType, index, command, targetState, description, isStringTrigger)
     if not tcp.IsConnected then
         DebugLog("ERROR", "TCP connection not available. Cannot prepare command.")
         return false
@@ -398,6 +401,12 @@ local function PrepareCommand(commandType, index, command, targetState, descript
         targetState = targetState,
         description = description
     }
+    
+    -- Track if this is a string trigger that needs to be cleared after execution
+    if isStringTrigger then
+        pendingStringTrigger = true
+        DebugLog("DEBUG", "String trigger command prepared - will clear string after execution")
+    end
     
     isWaitingForUserConfirmation = true
     SetWaitingState(true)
@@ -473,6 +482,16 @@ local function ExecutePendingCommand()
         targetState = nil,
         description = nil
     }
+    
+    -- Clear string trigger if this was a string-triggered command
+    if pendingStringTrigger and GroupTriggerString then
+        CreateSafeTimer(0.1, function()
+            GroupTriggerString.String = ""
+            DebugLog("DEBUG", "String trigger cleared after command execution")
+        end)
+        pendingStringTrigger = false
+    end
+    
     -- Don't set isWaitingForUserConfirmation = false here - let the PDU response handler do it
     
     return true
@@ -501,6 +520,16 @@ local function CancelPendingCommand()
         targetState = nil,
         description = nil
     }
+    
+    -- Clear string trigger if this was a string-triggered command
+    if pendingStringTrigger and GroupTriggerString then
+        CreateSafeTimer(0.1, function()
+            GroupTriggerString.String = ""
+            DebugLog("DEBUG", "String trigger cleared after command cancellation")
+        end)
+        pendingStringTrigger = false
+    end
+    
     isWaitingForUserConfirmation = false
     SetWaitingState(false)
     SetConfirmButtonState(false)
@@ -633,6 +662,7 @@ local function InitializeStates()
     -- NEW: Reset confirmation system states
     isWaitingForUserConfirmation = false
     lastToggledControl = nil
+    pendingStringTrigger = false
     pendingCommand = {
         type = nil,
         index = nil,
@@ -645,6 +675,7 @@ local function InitializeStates()
     lastBroadcastTime = 0
     lastBroadcastName = ""
     pendingCycleGroup = nil
+    receiverGroupIndex = nil
     
     -- Reset UI controls
     SetProcessingState(false)
@@ -1867,9 +1898,20 @@ local function TriggerGroupByName(groupName)
         return false
     end
     
-    if isProcessingCommand or isProcessingBroadcast or pendingConfirmation then
+    -- Check if system is busy, but allow processing if only broadcast flags are stuck
+    if isProcessingCommand or pendingConfirmation then
         DebugLog("WARNING", "System busy - cannot process group trigger for: %s", groupName)
         return false
+    end
+    
+    -- If broadcast flags are stuck, clear them to allow processing
+    if isProcessingBroadcast or isWaitingForCycle then
+        DebugLog("WARNING", "Broadcast flags stuck - clearing to allow group trigger processing")
+        isProcessingBroadcast = false
+        isWaitingForCycle = false
+        pendingCycleGroup = nil
+        isBroadcastReceiver = false
+        receiverGroupIndex = nil
     end
     
     local groupIndex = findGroupIndexByName(groupName)
@@ -1888,40 +1930,17 @@ local function TriggerGroupByName(groupName)
     
     DebugLog("INFO", "String trigger: Group '%s' (index %d) - power cycling", groupName, groupIndex)
     
-    -- Store current state for potential cancellation
-    StoreCurrentState()
-    currentOperation = {
-        type = "cycle_group",
-        index = groupIndex,
-        state = currentState  -- Store current state for cycle operations
-    }
+    -- Use the new confirmation system instead of direct command execution
+    local description = string.format("Power cycle %s (string trigger)", groupName)
+    local command = string.format("power outletgroup %d cycle", groupIndex)
     
-    -- Set up broadcast communication for cycle operation
-    pendingCycleGroup = groupIndex
-    
-    isBroadcastReceiver = false
-    isProcessingBroadcast = true
-    isWaitingForCycle = true
-    
-    -- Directly trigger the group cycle operation
-    isUserInitiatedCommand = true
-    SetWaitingState(true)
-    timeoutTimer:Start(CONFIG.TIMEOUT * 2)
-    
-    isGroupOperationInProgress = true
-
-    -- Trigger broadcast for synchronized cycle across PDUs
-    if BroadcastGroupCycle and BroadcastGroupName then
-        BroadcastGroupName.String = groupName
-        DebugLog("INFO", "Broadcasting cycle for group: %s", groupName)
-        BroadcastGroupCycle:Trigger()
+    if PrepareCommand("cycle_group", groupIndex, command, currentState, description, true) then
+        DebugLog("INFO", "String trigger command prepared: %s", command)
+        return true
+    else
+        DebugLog("ERROR", "Failed to prepare string trigger command")
+        return false
     end
-    
-    -- Send cycle command for the initiating PDU
-    sendTCP("power outletgroup ".. groupIndex .. " cycle")
-    DebugLog("INFO", "String trigger sent command: power outletgroup %d cycle", groupIndex)
-    
-    return true
 end
 
 -- Power cycle group handlers
@@ -2052,12 +2071,14 @@ if GroupTriggerString then
             
             local success = TriggerGroupByName(groupName)
             if success then
-                -- Clear the string after successful trigger
+                -- String will be cleared after user confirms and command is executed
+                DebugLog("INFO", "String trigger command prepared - waiting for user confirmation")
+            else
+                DebugLog("WARNING", "Failed to trigger group: %s", groupName)
+                -- Clear the string immediately if command preparation failed
                 CreateSafeTimer(0.1, function()
                     ctl.String = ""
                 end)
-            else
-                DebugLog("WARNING", "Failed to trigger group: %s", groupName)
             end
         end
     end
@@ -2181,6 +2202,23 @@ CreateSafeTimer(60, function()
         DebugLog("WARNING", "Processing LED stuck ON without active operations - forcing OFF")
         SetProcessingState(false)
     end
+    
+    -- Safety mechanism: Clear stuck broadcast flags
+    if isProcessingBroadcast or isWaitingForCycle then
+        local currentTime = os.time()
+        local timeSinceLastBroadcast = currentTime - lastBroadcastTime
+        
+        -- If broadcast flags have been active for more than 30 seconds without activity, clear them
+        if timeSinceLastBroadcast > 30 then
+            DebugLog("WARNING", "Broadcast flags stuck for %d seconds - clearing to prevent system lockup", timeSinceLastBroadcast)
+            isProcessingBroadcast = false
+            isWaitingForCycle = false
+            pendingCycleGroup = nil
+            isBroadcastReceiver = false
+            receiverGroupIndex = nil
+            isBroadcastCancelled = false
+        end
+    end
 end)
 
 -- Periodic health monitoring
@@ -2206,5 +2244,5 @@ CreateSafeTimer(0.1, AutoConnect)
 -- =============================================================================
 -- SCRIPT INITIALIZATION COMPLETE
 -- =============================================================================
-DebugLog("INFO", "Legrand PDU Control Script v3.18 initialized successfully")
+DebugLog("INFO", "Legrand PDU Control Script v3.20 initialized successfully")
 DebugLog("INFO", "Waiting for connection configuration...")
